@@ -78,7 +78,9 @@ class TimeExpandedGraph:
             if node.turns_remaining == 1:
                 yield TEEdge(
                     from_node=node,
-                    to_node=TENode(zone=node.in_transit_to, time=next_time),
+                    to_node=TENode(
+                        zone=node.in_transit_to, time=next_time
+                        ),
                     cost=0
                 )
             else:
@@ -128,3 +130,9 @@ class TimeExpandedGraph:
         if node.is_in_transit:
             return 1  # edge capacity (1 drone per edge direction at a time)
         return self.graph.zones[node.zone].max_drone_capacity
+
+    def conflict_key(self, node: TENode) -> tuple:
+        """CBS uses this to group drones and detect conflicts."""
+        if node.is_in_transit:
+            return ("edge", node.zone, node.in_transit_to, node.time)
+        return ("vertex", node.zone, node.time)
