@@ -1,7 +1,9 @@
-
+# from parser import Parser
+# from graph import Graph
 
 def main():
-    # parsing
+    #  init Parser
+    # parser = Parser()
     # graph creation
     # solving it
     # run
