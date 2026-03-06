@@ -5,7 +5,6 @@ Run CBS on the Impossible Dream map with A* as the low-level solver.
 import re
 import time
 from heapq import heappush, heappop
-from collections import deque
 
 from graph import Graph, Zone, Connection, TimeExpandedGraph, TENode
 from planner import CBSPlanner, Drone, Constraint, CTNode
@@ -108,20 +107,27 @@ def parse_map(filepath: str):
     return graph, coords, nb_drones, start_hub, end_hub
 
 
-# ── 2. BFS shortest-path heuristic (admissible, ignoring capacity) ───────────
+# ── 2. Weighted shortest-path heuristic (admissible, ignoring capacity) ─────
 
-def compute_bfs_distances(graph: Graph, goal: str) -> dict[str, int]:
-    """BFS from goal backwards on the static graph → perfect admissible h."""
+def compute_shortest_distances(graph: Graph, goal: str) -> dict[str, int]:
+    """Dijkstra from goal on static graph with zone-aware movement costs."""
     dist: dict[str, int] = {goal: 0}
-    queue = deque([goal])
-    while queue:
-        node = queue.popleft()
+    heap: list[tuple[int, str]] = [(0, goal)]
+
+    while heap:
+        current_cost, node = heappop(heap)
+        if current_cost > dist.get(node, 10**9):
+            continue
+
         for nbr in graph.neighbors(node):
-            if nbr not in dist:
-                # each edge costs at least `number_of_turns` hops
-                cost = graph.get_edge_cost(node, nbr)
-                dist[nbr] = dist[node] + cost
-                queue.append(nbr)
+            if graph.is_blocked_zone(nbr):
+                continue
+            move_cost = graph.movement_cost(node, nbr)
+            new_cost = current_cost + move_cost
+            if new_cost < dist.get(nbr, 10**9):
+                dist[nbr] = new_cost
+                heappush(heap, (new_cost, nbr))
+
     return dist
 
 
@@ -136,7 +142,7 @@ def a_star_low_level(
 ) -> list[TENode] | None:
     """
     A* on the time-expanded graph, respecting CBS constraints.
-    Heuristic = BFS distance on the static graph (admissible).
+    Heuristic = weighted shortest distance on the static graph (admissible).
     """
     start_node = TENode(zone=drone.start, time=0)
     goal_zone = drone.end
@@ -144,13 +150,16 @@ def a_star_low_level(
     # Baseline A*: no pre-indexed constraints and no closed-set pruning.
     g: dict[TENode, int] = {start_node: 0}
     parent: dict[TENode, TENode | None] = {start_node: None}
-    open_list: list[tuple[int, int, TENode]] = []
+    # Heap order: f-score, priority bias, insertion order, node.
+    # Priority zones keep same movement cost but are preferred on ties.
+    open_list: list[tuple[int, int, int, TENode]] = []
     counter = 0
     h0 = h_table.get(drone.start, 0)
-    heappush(open_list, (h0, counter, start_node))
+    start_bias = 0 if teg.graph.is_priority_zone(drone.start) else 1
+    heappush(open_list, (h0, start_bias, counter, start_node))
 
     while open_list:
-        f, _, current = heappop(open_list)
+        _, _, _, current = heappop(open_list)
 
         # goal check: drone is *at* the goal zone, not in transit
         if current.zone == goal_zone and not current.is_in_transit:
@@ -174,8 +183,11 @@ def a_star_low_level(
                 parent[nxt] = current
                 h_key = nxt.in_transit_to if nxt.is_in_transit else nxt.zone
                 h = h_table.get(h_key, 0) if h_key else 0
+                priority_bias = (
+                    0 if teg.graph.is_priority_zone(nxt.zone) else 1
+                )
                 counter += 1
-                heappush(open_list, (new_g + h, counter, nxt))
+                heappush(open_list, (new_g + h, priority_bias, counter, nxt))
 
     return None  # no path found
 
@@ -330,8 +342,8 @@ def main():
     nb_drones_actual = nb_drones
     print()
 
-    # Admissible heuristic table (BFS from goal on static graph)
-    h_table = compute_bfs_distances(graph, end_hub)
+    # Admissible heuristic table (weighted shortest distances on static graph)
+    h_table = compute_shortest_distances(graph, end_hub)
     shortest_static = h_table.get(start_hub)
     print(f"  Shortest static path (start→goal, ignoring capacity): "
           f"{shortest_static} turns")
@@ -363,8 +375,8 @@ def main():
         total_cost = sum(path[-1].time for path in solution.values())
         makespan = max(path[-1].time for path in solution.values())
         print("\n  === RESULTS ===")
-        print(f"  Sum-of-Costs (SOC): {total_cost} turns")
-        print(f"  Makespan (last drone arrives): {makespan} turns")
+        print(f"  Total turns (objective / makespan): {makespan} turns")
+        print(f"  Sum-of-Costs (secondary): {total_cost} turns")
         print()
         for drone_id in sorted(solution):
             path = solution[drone_id]

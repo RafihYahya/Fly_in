@@ -93,8 +93,11 @@ class CBSPlanner:
         return None
 
     def compute_cost(self, paths: dict[int, list[TENode]]) -> int:
-        '''Sum-of-Costs (SOC): total arrival time of all drones'''
-        return sum(path[-1].time for path in paths.values() if path)
+        '''Primary objective: minimize total simulation turns (makespan).'''
+        return max(
+            (path[-1].time for path in paths.values() if path),
+            default=0,
+        )
 
     def solve(self) -> dict[int, list[TENode]] | None:
         initial_paths = {}

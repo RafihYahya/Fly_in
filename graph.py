@@ -44,11 +44,35 @@ class Graph:
     def get_edge_cost(self, zone_a: str, zone_b: str) -> int:
         return self.connections[(zone_a, zone_b)].number_of_turns
 
+    def zone_entry_cost(self, zone_name: str) -> int:
+        zone = self.zones[zone_name]
+        if zone.is_blocked or zone.zone_type == "blocked":
+            return 10**9
+        if zone.zone_type == "restricted":
+            return 2
+        # normal and priority both cost 1 turn to enter.
+        return 1
+
+    def movement_cost(self, zone_a: str, zone_b: str) -> int:
+        """Return turn cost to move from zone_a into zone_b.
+
+        The movement cost respects both edge turns and destination zone type:
+        - blocked destination => invalid (treated as very high cost)
+        - restricted destination => at least 2 turns
+        - normal/priority destination => at least 1 turn
+        """
+        base_turns = self.get_edge_cost(zone_a, zone_b)
+        enter_turns = self.zone_entry_cost(zone_b)
+        return max(base_turns, enter_turns)
+
     def get_capacity(self, zone_name: str) -> int:
         return self.zones[zone_name].max_drone_capacity
 
     def is_blocked_zone(self, zone_name: str) -> bool:
         return self.zones[zone_name].is_blocked
+
+    def is_priority_zone(self, zone_name: str) -> bool:
+        return self.zones[zone_name].zone_type == "priority"
 
 
 @dataclass(frozen=True)  # why ?
@@ -90,7 +114,8 @@ class TimeExpandedGraph:
                     to_node=TENode(
                         zone=node.in_transit_to, time=next_time
                         ),
-                    cost=0
+                    # Landing consumes the final turn of a multi-turn move.
+                    cost=1
                 )
             else:
                 yield TEEdge(
@@ -120,12 +145,12 @@ class TimeExpandedGraph:
         for nbrs_zone in self.graph.neighbors(node.zone):
             if self.graph.is_blocked_zone(nbrs_zone):
                 continue
-            conn = self.graph.get_connection(node.zone, nbrs_zone)
-            if conn.number_of_turns == 1:
+            move_turns = self.graph.movement_cost(node.zone, nbrs_zone)
+            if move_turns == 1:
                 yield TEEdge(
                     from_node=node,
                     to_node=TENode(zone=nbrs_zone, time=next_time),
-                    cost=conn.number_of_turns
+                    cost=move_turns
                 )
             else:
                 yield TEEdge(
@@ -134,7 +159,7 @@ class TimeExpandedGraph:
                         zone=node.zone,
                         time=next_time,
                         in_transit_to=nbrs_zone,
-                        turns_remaining=conn.number_of_turns - 1
+                        turns_remaining=move_turns - 1
                     ),
                     cost=1
                 )
