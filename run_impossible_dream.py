@@ -45,6 +45,8 @@ def parse_map(filepath: str):
 
                 zone_type = "normal"
                 max_drones = 1  # default
+                color = None
+                is_blocked = False
 
                 if props_str:
                     cap_m = re.search(r"max_drones=(\d+)", props_str)
@@ -53,9 +55,22 @@ def parse_map(filepath: str):
                     zone_m = re.search(r"zone=(\w+)", props_str)
                     if zone_m:
                         zone_type = zone_m.group(1)
+                    color_m = re.search(r"color=(\w+)", props_str)
+                    if color_m:
+                        color = color_m.group(1)
+                    blocked_m = re.search(r"blocked=(true|false)", props_str)
+                    if blocked_m:
+                        is_blocked = blocked_m.group(1) == "true"
+                    if zone_type == "blocked":
+                        is_blocked = True
 
-                zone = Zone(name=name, zone_type=zone_type,
-                            max_drone_capacity=max_drones)
+                zone = Zone(
+                    name=name,
+                    zone_type=zone_type,
+                    max_drone_capacity=max_drones,
+                    color=color,
+                    is_blocked=is_blocked,
+                )
                 graph.add_zone(zone)
 
                 if kind == "start_hub":
@@ -71,11 +86,20 @@ def parse_map(filepath: str):
             if cm:
                 a, b, props_str = cm.groups()
                 turns = 1  # default edge weight
+                max_link_capacity = 1
                 if props_str:
                     t_m = re.search(r"number_of_turns=(\d+)", props_str)
                     if t_m:
                         turns = int(t_m.group(1))
-                conn = Connection(zone_a=a, zone_b=b, number_of_turns=turns)
+                    cap_m = re.search(r"max_link_capacity=(\d+)", props_str)
+                    if cap_m:
+                        max_link_capacity = int(cap_m.group(1))
+                conn = Connection(
+                    zone_a=a,
+                    zone_b=b,
+                    number_of_turns=turns,
+                    max_link_capacity=max_link_capacity,
+                )
                 graph.add_connection(conn)
                 continue
 
@@ -103,22 +127,6 @@ def compute_bfs_distances(graph: Graph, goal: str) -> dict[str, int]:
 
 # ── 3. A* low-level solver (constrained) ─────────────────────────────────────
 
-def _build_constraint_set(constraints: list[Constraint]) -> set[tuple]:
-    """Pre-index constraints for O(1) lookup instead of O(n) scan."""
-    cset: set[tuple] = set()
-    for c in constraints:
-        if c.is_edge_constraint:
-            cset.add((c.time, c.zone, c.in_transit_to))
-        else:
-            cset.add((c.time, c.zone, None))
-    return cset
-
-
-def _is_blocked(node: TENode, cset: set[tuple]) -> bool:
-    if node.is_in_transit:
-        return (node.time, node.zone, node.in_transit_to) in cset
-    return (node.time, node.zone, None) in cset
-
 
 def a_star_low_level(
     teg: TimeExpandedGraph,
@@ -132,22 +140,17 @@ def a_star_low_level(
     """
     start_node = TENode(zone=drone.start, time=0)
     goal_zone = drone.end
-    cset = _build_constraint_set(constraints)
 
+    # Baseline A*: no pre-indexed constraints and no closed-set pruning.
     g: dict[TENode, int] = {start_node: 0}
     parent: dict[TENode, TENode | None] = {start_node: None}
     open_list: list[tuple[int, int, TENode]] = []
-    closed: set[TENode] = set()
     counter = 0
     h0 = h_table.get(drone.start, 0)
     heappush(open_list, (h0, counter, start_node))
 
     while open_list:
         f, _, current = heappop(open_list)
-
-        if current in closed:
-            continue
-        closed.add(current)
 
         # goal check: drone is *at* the goal zone, not in transit
         if current.zone == goal_zone and not current.is_in_transit:
@@ -161,9 +164,8 @@ def a_star_low_level(
 
         for edge in teg.get_neighbous(current):
             nxt = edge.to_node
-            if nxt in closed:
-                continue
-            if _is_blocked(nxt, cset):
+            blocked = any(c.blocks(nxt, drone.drone_id) for c in constraints)
+            if blocked:
                 continue
 
             new_g = g[current] + edge.cost
@@ -192,6 +194,9 @@ def patched_low_level(
 # ── 5. Main ──────────────────────────────────────────────────────────────────
 
 def prioritized_init(planner: CBSPlanner, teg: TimeExpandedGraph):
+    # OPTIMIZATION 2: Prioritized initialization.
+    # Plan drones sequentially and block already-full (zone/time) resources
+    # from earlier drones, which dramatically reduces root conflicts.
     """Plan drones sequentially — each respects prior drones' paths.
     Produces far fewer initial conflicts than independent planning."""
     paths: dict[int, list[TENode]] = {}
@@ -239,7 +244,8 @@ def solve_with_logging(planner: CBSPlanner, teg: TimeExpandedGraph,
     iterations = 0
     bypasses = 0
 
-    # Prioritized initialization: far fewer initial conflicts
+    # OPTIMIZATION 2 (applied here): use prioritized initialization instead of
+    # independent initial planning.
     print("  Building prioritized initial paths ...")
     initial_paths = prioritized_init(planner, teg)
     if initial_paths is None:
@@ -276,44 +282,6 @@ def solve_with_logging(planner: CBSPlanner, teg: TimeExpandedGraph,
             return ct_node.paths
 
         drone_a, drone_b, conflicting_node = conflict
-
-        # ── CBS Bypass: try to resolve without branching ──
-        bypassed = False
-        for drone_id in (drone_a, drone_b):
-            new_constraint = Constraint(
-                drone_id=drone_id,
-                time=conflicting_node.time,
-                zone=conflicting_node.zone,
-                in_transit_to=conflicting_node.in_transit_to,
-            )
-            if new_constraint in ct_node.constraints:
-                continue
-            new_constraints = ct_node.constraints + [new_constraint]
-            drone = next(
-                d for d in planner.drones if d.drone_id == drone_id
-            )
-            drone_constraints = [
-                c for c in new_constraints if c.drone_id == drone_id
-            ]
-            new_path = planner.low_level(
-                drone=drone, constraints=drone_constraints
-            )
-            if not new_path:
-                continue
-            old_cost = ct_node.paths[drone_id][-1].time
-            new_cost = new_path[-1].time
-            # Bypass: same or better cost → adopt without branching
-            if new_cost <= old_cost:
-                ct_node.paths[drone_id] = new_path
-                ct_node.constraints = new_constraints
-                ct_node.cost = planner.compute_cost(ct_node.paths)
-                heappush(open_list, (ct_node.cost, ct_node))
-                bypasses += 1
-                bypassed = True
-                break
-
-        if bypassed:
-            continue
 
         # ── Normal CBS branching (only when bypass fails) ──
         for drone_id in (drone_a, drone_b):
@@ -372,7 +340,6 @@ def main():
     # Time horizon: generous upper bound
     max_time = shortest_static * nb_drones + 50 if shortest_static else 300
     print(f"  Time horizon (max_time): {max_time}")
-
     teg = TimeExpandedGraph(graph, max_time)
 
     # Create drones

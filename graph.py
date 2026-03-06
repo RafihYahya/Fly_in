@@ -7,6 +7,8 @@ class Zone:
     name: str
     zone_type: str = "normal"
     max_drone_capacity: int = 1
+    color: str | None = None
+    is_blocked: bool = False
 
 
 @dataclass
@@ -14,6 +16,7 @@ class Connection:
     zone_a: str
     zone_b: str
     number_of_turns: int
+    max_link_capacity: int = 1
 
 
 class Graph:
@@ -43,6 +46,9 @@ class Graph:
 
     def get_capacity(self, zone_name: str) -> int:
         return self.zones[zone_name].max_drone_capacity
+
+    def is_blocked_zone(self, zone_name: str) -> bool:
+        return self.zones[zone_name].is_blocked
 
 
 @dataclass(frozen=True)  # why ?
@@ -76,6 +82,9 @@ class TimeExpandedGraph:
         next_time = node.time + 1
         if node.in_transit_to:
             if node.turns_remaining == 1:
+                # A transit that would land in a blocked zone is invalid.
+                if self.graph.is_blocked_zone(node.in_transit_to):
+                    return
                 yield TEEdge(
                     from_node=node,
                     to_node=TENode(
@@ -96,6 +105,10 @@ class TimeExpandedGraph:
                 )
             return
 
+        # Cannot stand still in a blocked zone.
+        if self.graph.is_blocked_zone(node.zone):
+            return
+
         yield TEEdge(
             from_node=node,
             to_node=TENode(
@@ -105,6 +118,8 @@ class TimeExpandedGraph:
             cost=1
         )
         for nbrs_zone in self.graph.neighbors(node.zone):
+            if self.graph.is_blocked_zone(nbrs_zone):
+                continue
             conn = self.graph.get_connection(node.zone, nbrs_zone)
             if conn.number_of_turns == 1:
                 yield TEEdge(
@@ -128,11 +143,22 @@ class TimeExpandedGraph:
         """Capacity check — in-transit drones don't count against zone
         capacity."""
         if node.is_in_transit:
-            return 1  # edge capacity (1 drone per edge direction at a time)
+            # node.is_in_transit guarantees destination exists; keep narrowing
+            # explicit for static type checkers.
+            dst = node.in_transit_to
+            if dst is None:
+                return 0
+            conn = self.graph.get_connection(node.zone, dst)
+            return conn.max_link_capacity
         return self.graph.zones[node.zone].max_drone_capacity
 
     def conflict_key(self, node: TENode) -> tuple:
         """CBS uses this to group drones and detect conflicts."""
         if node.is_in_transit:
-            return ("edge", node.zone, node.in_transit_to, node.time)
+            # Undirected key so opposite directions share the same link budget.
+            dst = node.in_transit_to
+            if dst is None:
+                return ("edge", node.zone, node.zone, node.time)
+            a, b = sorted((node.zone, dst))
+            return ("edge", a, b, node.time)
         return ("vertex", node.zone, node.time)
