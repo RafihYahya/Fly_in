@@ -1,14 +1,15 @@
 
 from graph import TENode, TimeExpandedGraph
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from heapq import heappop, heappush
 
 
+@dataclass
 class Drone:
     drone_id: int
     start: str
     end: str
-    path: list[TENode] = []
+    path: list[TENode] = field(default_factory=list)
 
     def position_at(self, time: int):
         if not self.path:
@@ -56,14 +57,44 @@ class CBSPlanner:
         self.teg = teg
         self.drones = drones
 
-    def low_level(self, drone, constraints):
+    def low_level(
+        self, drone: Drone, constraints: list[Constraint]
+    ) -> list[TENode] | None:
+        # TODO: implement constrained low-level planner (A* or Dijkstra).
         pass
 
-    def find_conflict(self, paths):
-        pass
+    def find_conflict(
+        self, paths: dict[int, list[TENode]]
+    ) -> tuple[int, int, TENode] | None:
+        if not paths:
+            return None
+        max_time = max(len(path) for path in paths.values())
+        # Scan in time order so CBS branches on the earliest conflict first.
+        for time in range(max_time):
+            occupancy: dict[tuple, list[tuple[int, TENode]]] = {}
 
-    def compute_cost(self, path):
-        pass
+            for drone_id, path in paths.items():
+                if not path:
+                    continue
+
+                node = path[min(time, len(path) - 1)]
+                key = self.teg.conflict_key(node)
+                occupancy.setdefault(key, []).append((drone_id, node))
+
+            for drones_on_resource in occupancy.values():
+                sample_node = drones_on_resource[0][1]
+                capacity = self.teg.capacity(sample_node)
+
+                if len(drones_on_resource) > capacity:
+                    drone_a, conflicting_node = drones_on_resource[0]
+                    drone_b, _ = drones_on_resource[1]
+                    return drone_a, drone_b, conflicting_node
+
+        return None
+
+    def compute_cost(self, paths: dict[int, list[TENode]]) -> int:
+        '''Sum-of-Costs (SOC): total arrival time of all drones'''
+        return sum(path[-1].time for path in paths.values() if path)
 
     def solve(self) -> dict[int, list[TENode]] | None:
         initial_paths = {}
@@ -79,28 +110,23 @@ class CBSPlanner:
             cost=self.compute_cost(initial_paths)
         )
 
-        # STEP 2 — push root onto open list
+        #  push root onto open list
         open_list = []
         heappush(open_list, (root.cost, root))
 
         while open_list:
 
-            # STEP 3 — pop cheapest CTNode
+            #  pop cheapest CTNode
             _, ct_node = heappop(open_list)
-
-            # STEP 4 — check for conflicts in current paths
+            # check for conflicts in current paths
             conflict = self.find_conflict(ct_node.paths)
-
-            # STEP 5 — no conflict means all paths are valid, return solution
+            # no conflict means all paths are valid, return solution
             if conflict is None:
                 return ct_node.paths
-
-            # STEP 6 — conflict found, unpack it
+            # conflict found, unpack it
             drone_a, drone_b, conflicting_node = conflict
-
-            # STEP 7 — split into two children, one per drone involved
+            # split into two children, one per drone involved
             for drone_id in (drone_a, drone_b):
-
                 # build the new constraint that forbids this drone conflicting
                 new_constraint = Constraint(
                     drone_id=drone_id,
@@ -108,14 +134,11 @@ class CBSPlanner:
                     zone=conflicting_node.zone,
                     in_transit_to=conflicting_node.in_transit_to
                 )
-
                 # skip if this constraint already exists in this branch
                 if new_constraint in ct_node.constraints:
                     continue
-
                 # inherit all parent constraints and add new one
                 new_constraints = ct_node.constraints + [new_constraint]
-
                 # replan ONLY the constrained drone
                 drone = next(d for d in self.drones if d.drone_id == drone_id)
                 drone_constraints = [
@@ -124,11 +147,9 @@ class CBSPlanner:
                 new_path = self.low_level(
                     drone=drone, constraints=drone_constraints
                     )
-
                 # if no path found under these constraints, prune this branch
                 if not new_path:
                     continue
-
                 # build child CTNode with updated path for replanned drone
                 new_paths = dict(ct_node.paths)   # copy all paths
                 new_paths[drone_id] = new_path
@@ -138,8 +159,6 @@ class CBSPlanner:
                     paths=new_paths,
                     cost=self.compute_cost(new_paths)
                 )
-
-                # STEP 8 — push child onto open list
+                # push child onto open list
                 heappush(open_list, (child.cost, child))
-
         return None
