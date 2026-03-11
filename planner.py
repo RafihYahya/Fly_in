@@ -60,8 +60,55 @@ class CBSPlanner:
     def low_level(
         self, drone: Drone, constraints: list[Constraint]
     ) -> list[TENode] | None:
-        # TODO: implement constrained low-level planner (A* or Dijkstra).
-        pass
+        """
+        Uniform-cost search on the time-expanded graph, respecting CBS
+        constraints (A* with h=0).
+        """
+        start_node = TENode(zone=drone.start, time=0)
+        goal_zone = drone.end
+
+        # Baseline A*: no pre-indexed constraints and no closed-set pruning.
+        g: dict[TENode, int] = {start_node: 0}
+        parent: dict[TENode, TENode | None] = {start_node: None}
+        # Heap order: f-score, priority bias, insertion order, node.
+        # Priority zones keep same movement cost but are preferred on ties.
+        open_list: list[tuple[int, int, int, TENode]] = []
+        counter = 0
+        start_bias = 0 if self.teg.graph.is_priority_zone(drone.start) else 1
+        heappush(open_list, (0, start_bias, counter, start_node))
+
+        while open_list:
+            _, _, _, current = heappop(open_list)
+
+            # goal check: drone is *at* the goal zone, not in transit
+            if current.zone == goal_zone and not current.is_in_transit:
+                path = []
+                n = current
+                while n is not None:
+                    path.append(n)
+                    n = parent[n]
+                path.reverse()
+                return path
+
+            for edge in self.teg.get_neighbous(current):
+                nxt = edge.to_node
+                blocked = any(
+                    c.blocks(nxt, drone.drone_id) for c in constraints
+                    )  # what any does ?
+                if blocked:
+                    continue
+
+                new_g = g[current] + edge.cost
+                if nxt not in g or new_g < g[nxt]:
+                    g[nxt] = new_g
+                    parent[nxt] = current
+                    priority_bias = (
+                        0 if self.teg.graph.is_priority_zone(nxt.zone) else 1
+                    )
+                    counter += 1
+                    heappush(open_list, (new_g, priority_bias, counter, nxt))
+
+        return None  # no path found
 
     def find_conflict(
         self, paths: dict[int, list[TENode]]
@@ -99,12 +146,58 @@ class CBSPlanner:
             default=0,
         )
 
+    def _prioritized_init(self):
+        # Plan drones sequentially and block already-full (zone/time) resources
+        # from earlier drones, which dramatically reduces root conflicts.
+        """Plan drones sequentially — each respects prior drones' paths.
+        Produces far fewer initial conflicts than independent planning."""
+        paths: dict[int, list[TENode]] = {}
+        for drone in self.drones:
+            # Build constraints from previously planned drones
+            constraints: list[Constraint] = []
+            # Track occupancy per conflict_key to respect capacity > 1
+            occupancy: dict[tuple, int] = {}
+            for prev_path in paths.values():
+                for node in prev_path:
+                    key = self.teg.conflict_key(node)
+                    occupancy[key] = occupancy.get(key, 0) + 1
+
+            added: set[tuple] = set()
+            for prev_path in paths.values():
+                for node in prev_path:
+                    key = self.teg.conflict_key(node)
+                    cap = self.teg.capacity(node)
+                    if occupancy.get(key, 0) >= cap and key not in added:
+                        added.add(key)
+                        constraints.append(Constraint(
+                            drone_id=drone.drone_id,
+                            time=node.time,
+                            zone=node.zone,
+                            in_transit_to=(
+                             node.in_transit_to if node.is_in_transit else None
+                            ),
+                        ))
+
+            path = self.low_level(drone=drone, constraints=constraints)
+            if path is None:
+                # Fallback: plan without constraints
+                path = self.low_level(drone=drone, constraints=[])
+            if path is None:
+                print(
+                    f"  Drone {drone.drone_id} has no path at all — unsolvable"
+                    )
+                return None
+            paths[drone.drone_id] = path
+        return paths
+
     def solve(self) -> dict[int, list[TENode]] | None:
-        initial_paths = {}
+        initial_paths = self._prioritized_init()
+        if initial_paths is None:
+            initial_paths = {}
         for drone in self.drones:
             path = self.low_level(drone=drone, constraints=[])
             if not path:
-                return None  # drone has no path at all, unsolvable
+                return None  # drone has no path
             initial_paths[drone.drone_id] = path
 
         root = CTNode(

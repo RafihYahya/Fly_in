@@ -2,211 +2,15 @@
 Run CBS on the Impossible Dream map with A* as the low-level solver.
 """
 
-import re
 import time
 from heapq import heappush, heappop
 
-from graph import Graph, Zone, Connection, TimeExpandedGraph, TENode
+from graph import TimeExpandedGraph, TENode
 from planner import CBSPlanner, Drone, Constraint, CTNode
+from parser import Parser
 
-
-# ── 1. Parse the map file ────────────────────────────────────────────────────
-
-def parse_map(filepath: str):
-    """Parse the .txt map file into a Graph plus metadata."""
-    graph = Graph()
-    coords: dict[str, tuple[float, float]] = {}
-    nb_drones = 0
-    start_hub = None
-    end_hub = None
-
-    with open(filepath) as f:
-        for raw_line in f:
-            line = raw_line.split("#")[0].strip()
-            if not line:
-                continue
-
-            # nb_drones
-            if line.startswith("nb_drones:"):
-                nb_drones = int(line.split(":")[1].strip())
-                continue
-
-            # hub lines: start_hub / hub / end_hub
-            m = re.match(
-                r"(start_hub|hub|end_hub):\s+(\S+)\s+([\d.\-]+)\s+([\d.\-]+)"
-                r"(?:\s+\[(.+)\])?",
-                line,
-            )
-            if m:
-                kind, name, x, y, props_str = m.groups()
-                x, y = float(x), float(y)
-                coords[name] = (x, y)
-
-                zone_type = "normal"
-                max_drones = 1  # default
-                color = None
-                is_blocked = False
-
-                if props_str:
-                    cap_m = re.search(r"max_drones=(\d+)", props_str)
-                    if cap_m:
-                        max_drones = int(cap_m.group(1))
-                    zone_m = re.search(r"zone=(\w+)", props_str)
-                    if zone_m:
-                        zone_type = zone_m.group(1)
-                    color_m = re.search(r"color=(\w+)", props_str)
-                    if color_m:
-                        color = color_m.group(1)
-                    blocked_m = re.search(r"blocked=(true|false)", props_str)
-                    if blocked_m:
-                        is_blocked = blocked_m.group(1) == "true"
-                    if zone_type == "blocked":
-                        is_blocked = True
-
-                zone = Zone(
-                    name=name,
-                    zone_type=zone_type,
-                    max_drone_capacity=max_drones,
-                    color=color,
-                    is_blocked=is_blocked,
-                )
-                graph.add_zone(zone)
-
-                if kind == "start_hub":
-                    start_hub = name
-                elif kind == "end_hub":
-                    end_hub = name
-                continue
-
-            # connection lines
-            cm = re.match(
-                r"connection:\s+(\S+)-(\S+)(?:\s+\[(.+)\])?", line
-            )
-            if cm:
-                a, b, props_str = cm.groups()
-                turns = 1  # default edge weight
-                max_link_capacity = 1
-                if props_str:
-                    t_m = re.search(r"number_of_turns=(\d+)", props_str)
-                    if t_m:
-                        turns = int(t_m.group(1))
-                    cap_m = re.search(r"max_link_capacity=(\d+)", props_str)
-                    if cap_m:
-                        max_link_capacity = int(cap_m.group(1))
-                conn = Connection(
-                    zone_a=a,
-                    zone_b=b,
-                    number_of_turns=turns,
-                    max_link_capacity=max_link_capacity,
-                )
-                graph.add_connection(conn)
-                continue
-
-    if start_hub is None or end_hub is None:
-        raise ValueError("Map must define both start_hub and end_hub")
-    return graph, coords, nb_drones, start_hub, end_hub
-
-
-# ── 2. Weighted shortest-path heuristic (admissible, ignoring capacity) ─────
-
-def compute_shortest_distances(graph: Graph, goal: str) -> dict[str, int]:
-    """Dijkstra from goal on static graph with zone-aware movement costs."""
-    dist: dict[str, int] = {goal: 0}
-    heap: list[tuple[int, str]] = [(0, goal)]
-
-    while heap:
-        current_cost, node = heappop(heap)
-        if current_cost > dist.get(node, 10**9):
-            continue
-
-        for nbr in graph.neighbors(node):
-            if graph.is_blocked_zone(nbr):
-                continue
-            move_cost = graph.movement_cost(node, nbr)
-            new_cost = current_cost + move_cost
-            if new_cost < dist.get(nbr, 10**9):
-                dist[nbr] = new_cost
-                heappush(heap, (new_cost, nbr))
-
-    return dist
-
-
-# ── 3. A* low-level solver (constrained) ─────────────────────────────────────
-
-
-def a_star_low_level(
-    teg: TimeExpandedGraph,
-    drone: Drone,
-    constraints: list[Constraint],
-    h_table: dict[str, int],
-) -> list[TENode] | None:
-    """
-    A* on the time-expanded graph, respecting CBS constraints.
-    Heuristic = weighted shortest distance on the static graph (admissible).
-    """
-    start_node = TENode(zone=drone.start, time=0)
-    goal_zone = drone.end
-
-    # Baseline A*: no pre-indexed constraints and no closed-set pruning.
-    g: dict[TENode, int] = {start_node: 0}
-    parent: dict[TENode, TENode | None] = {start_node: None}
-    # Heap order: f-score, priority bias, insertion order, node.
-    # Priority zones keep same movement cost but are preferred on ties.
-    open_list: list[tuple[int, int, int, TENode]] = []
-    counter = 0
-    h0 = h_table.get(drone.start, 0)
-    start_bias = 0 if teg.graph.is_priority_zone(drone.start) else 1
-    heappush(open_list, (h0, start_bias, counter, start_node))
-
-    while open_list:
-        _, _, _, current = heappop(open_list)
-
-        # goal check: drone is *at* the goal zone, not in transit
-        if current.zone == goal_zone and not current.is_in_transit:
-            path = []
-            n = current
-            while n is not None:
-                path.append(n)
-                n = parent[n]
-            path.reverse()
-            return path
-
-        for edge in teg.get_neighbous(current):
-            nxt = edge.to_node
-            blocked = any(c.blocks(nxt, drone.drone_id) for c in constraints)
-            if blocked:
-                continue
-
-            new_g = g[current] + edge.cost
-            if nxt not in g or new_g < g[nxt]:
-                g[nxt] = new_g
-                parent[nxt] = current
-                h_key = nxt.in_transit_to if nxt.is_in_transit else nxt.zone
-                h = h_table.get(h_key, 0) if h_key else 0
-                priority_bias = (
-                    0 if teg.graph.is_priority_zone(nxt.zone) else 1
-                )
-                counter += 1
-                heappush(open_list, (new_g + h, priority_bias, counter, nxt))
-
-    return None  # no path found
-
-
-# ── 4. Monkey-patch low_level into CBSPlanner ────────────────────────────────
-
-def patched_low_level(
-    self: "CBSPlanner",
-    drone: Drone,
-    constraints: list[Constraint],
-) -> list[TENode] | None:
-    h = self._h_table  # type: ignore[attr-defined]
-    return a_star_low_level(self.teg, drone, constraints, h)
-
-
-# ── 5. Main ──────────────────────────────────────────────────────────────────
 
 def prioritized_init(planner: CBSPlanner, teg: TimeExpandedGraph):
-    # OPTIMIZATION 2: Prioritized initialization.
     # Plan drones sequentially and block already-full (zone/time) resources
     # from earlier drones, which dramatically reduces root conflicts.
     """Plan drones sequentially — each respects prior drones' paths.
@@ -329,10 +133,21 @@ def solve_with_logging(planner: CBSPlanner, teg: TimeExpandedGraph,
     return None
 
 
+def compact_route(path: list[TENode]) -> list[str]:
+    """Return only zone transitions from a time-expanded path."""
+    zones: list[str] = []
+    prev_zone = None
+    for node in path:
+        if node.zone != prev_zone:
+            zones.append(node.zone)
+            prev_zone = node.zone
+    return zones
+
+
 def main():
     filepath = "01_the_impossible_dream.txt"
     print(f"Parsing {filepath} ...")
-    graph, coords, nb_drones, start_hub, end_hub = parse_map(filepath)
+    graph, coords, nb_drones, start_hub, end_hub = Parser.parse_map(filepath)
 
     print(f"  Zones       : {len(graph.zones)}")
     print(f"  Connections : {len(graph.connections) // 2}")
@@ -342,12 +157,8 @@ def main():
     nb_drones_actual = nb_drones
     print()
 
-    # Admissible heuristic table (weighted shortest distances on static graph)
-    h_table = compute_shortest_distances(graph, end_hub)
-    shortest_static = h_table.get(start_hub)
-    print(f"  Shortest static path (start→goal, ignoring capacity): "
-          f"{shortest_static} turns")
-    print()
+    # No heuristic: use a conservative static fallback horizon.
+    shortest_static = 1
 
     # Time horizon: generous upper bound
     max_time = shortest_static * nb_drones + 50 if shortest_static else 300
@@ -362,8 +173,6 @@ def main():
 
     # Set up CBS planner with our A* low-level solver
     planner = CBSPlanner(teg, drones)
-    planner._h_table = h_table  # type: ignore[attr-defined]
-    CBSPlanner.low_level = patched_low_level  # type: ignore[assignment]
 
     print(f"\nRunning CBS with {nb_drones_actual} drones ...")
     solution = solve_with_logging(planner, teg, timeout=300.0)
@@ -381,14 +190,7 @@ def main():
         for drone_id in sorted(solution):
             path = solution[drone_id]
             arrival = path[-1].time
-            # compact path: only show zone transitions
-            zones = []
-            prev_zone = None
-            for node in path:
-                z = node.zone
-                if z != prev_zone:
-                    zones.append(z)
-                    prev_zone = z
+            zones = compact_route(path)
             print(f"  Drone {drone_id:2d}: arrives turn {arrival:3d}  "
                   f"  route: {' → '.join(zones)}")
 
