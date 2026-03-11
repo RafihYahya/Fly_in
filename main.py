@@ -17,7 +17,7 @@ def main():
     ]
     # Set up CBS planner with our A* low-level solver
     planner = CBSPlanner(teg, drones)
-    # solving it
+    paths = planner.solve(timeout=360)
     # run
     # visualize it
     ...

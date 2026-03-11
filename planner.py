@@ -2,6 +2,7 @@
 from graph import TENode, TimeExpandedGraph
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
+import time
 
 
 @dataclass
@@ -117,14 +118,14 @@ class CBSPlanner:
             return None
         max_time = max(len(path) for path in paths.values())
         # Scan in time order so CBS branches on the earliest conflict first.
-        for time in range(max_time):
+        for ctime in range(max_time):
             occupancy: dict[tuple, list[tuple[int, TENode]]] = {}
 
             for drone_id, path in paths.items():
                 if not path:
                     continue
 
-                node = path[min(time, len(path) - 1)]
+                node = path[min(ctime, len(path) - 1)]
                 key = self.teg.conflict_key(node)
                 occupancy.setdefault(key, []).append((drone_id, node))
 
@@ -190,15 +191,12 @@ class CBSPlanner:
             paths[drone.drone_id] = path
         return paths
 
-    def solve(self) -> dict[int, list[TENode]] | None:
+    def solve(self, timeout: float = 120.0) -> dict[int, list[TENode]] | None:
+        """Run CBS with a wall-clock timeout to avoid unbounded search."""
+        t0 = time.time()
         initial_paths = self._prioritized_init()
         if initial_paths is None:
-            initial_paths = {}
-        for drone in self.drones:
-            path = self.low_level(drone=drone, constraints=[])
-            if not path:
-                return None  # drone has no path
-            initial_paths[drone.drone_id] = path
+            return None
 
         root = CTNode(
             constraints=[],
@@ -211,9 +209,13 @@ class CBSPlanner:
         heappush(open_list, (root.cost, root))
 
         while open_list:
+            if time.time() - t0 > timeout:
+                print(f"  CBS timeout after {timeout:.1f}s")
+                return None
 
             #  pop cheapest CTNode
             _, ct_node = heappop(open_list)
+
             # check for conflicts in current paths
             conflict = self.find_conflict(ct_node.paths)
             # no conflict means all paths are valid, return solution
