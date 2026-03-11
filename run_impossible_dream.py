@@ -49,7 +49,7 @@ def main():
     planner = CBSPlanner(teg, drones)
 
     print(f"\nRunning CBS with {nb_drones_actual} drones ...")
-    solution = planner.solve(timeout=300.0)
+    solution = planner.solve()
 
     if solution is None:
         print("\n  CBS returned no solution.")

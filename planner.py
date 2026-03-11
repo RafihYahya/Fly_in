@@ -2,7 +2,6 @@
 from graph import TENode, TimeExpandedGraph
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
-import time
 
 
 @dataclass
@@ -191,9 +190,9 @@ class CBSPlanner:
             paths[drone.drone_id] = path
         return paths
 
-    def solve(self, timeout: float = 120.0) -> dict[int, list[TENode]] | None:
+    def solve(self) -> dict[int, list[TENode]] | None:
         """Run CBS with a wall-clock timeout to avoid unbounded search."""
-        t0 = time.time()
+        #  t0 = time.time()
         initial_paths = self._prioritized_init()
         if initial_paths is None:
             return None
@@ -209,9 +208,6 @@ class CBSPlanner:
         heappush(open_list, (root.cost, root))
 
         while open_list:
-            if time.time() - t0 > timeout:
-                print(f"  CBS timeout after {timeout:.1f}s")
-                return None
 
             #  pop cheapest CTNode
             _, ct_node = heappop(open_list)
