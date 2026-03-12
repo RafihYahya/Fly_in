@@ -67,11 +67,9 @@ class CBSPlanner:
         start_node = TENode(zone=drone.start, time=0)
         goal_zone = drone.end
 
-        # Baseline A*: no pre-indexed constraints and no closed-set pruning.
         g: dict[TENode, int] = {start_node: 0}
         parent: dict[TENode, TENode | None] = {start_node: None}
         # Heap order: f-score, priority bias, insertion order, node.
-        # Priority zones keep same movement cost but are preferred on ties.
         open_list: list[tuple[int, int, int, TENode]] = []
         counter = 0
         start_bias = 0 if self.teg.graph.is_priority_zone(drone.start) else 1
@@ -80,7 +78,6 @@ class CBSPlanner:
         while open_list:
             _, _, _, current = heappop(open_list)
 
-            # goal check: drone is *at* the goal zone, not in transit
             if current.zone == goal_zone and not current.is_in_transit:
                 path = []
                 n = current
@@ -116,7 +113,6 @@ class CBSPlanner:
         if not paths:
             return None
         max_time = max(len(path) for path in paths.values())
-        # Scan in time order so CBS branches on the earliest conflict first.
         for ctime in range(max_time):
             occupancy: dict[tuple, list[tuple[int, TENode]]] = {}
 
@@ -147,8 +143,6 @@ class CBSPlanner:
         )
 
     def _prioritized_init(self):
-        # Plan drones sequentially and block already-full (zone/time) resources
-        # from earlier drones, which dramatically reduces root conflicts.
         """Plan drones sequentially — each respects prior drones' paths.
         Produces far fewer initial conflicts than independent planning."""
         paths: dict[int, list[TENode]] = {}
@@ -192,7 +186,6 @@ class CBSPlanner:
 
     def solve(self) -> dict[int, list[TENode]] | None:
         """Run CBS with a wall-clock timeout to avoid unbounded search."""
-        #  t0 = time.time()
         initial_paths = self._prioritized_init()
         if initial_paths is None:
             return None
@@ -202,38 +195,28 @@ class CBSPlanner:
             paths=initial_paths,
             cost=self.compute_cost(initial_paths)
         )
-
-        #  push root onto open list
         open_list = []
         heappush(open_list, (root.cost, root))
 
         while open_list:
 
-            #  pop cheapest CTNode
             _, ct_node = heappop(open_list)
-
-            # check for conflicts in current paths
+            # check for conflicts
             conflict = self.find_conflict(ct_node.paths)
-            # no conflict means all paths are valid, return solution
             if conflict is None:
                 return ct_node.paths
-            # conflict found, unpack it
             drone_a, drone_b, conflicting_node = conflict
-            # split into two children, one per drone involved
             for drone_id in (drone_a, drone_b):
-                # build the new constraint that forbids this drone conflicting
+                # build the new constraint
                 new_constraint = Constraint(
                     drone_id=drone_id,
                     time=conflicting_node.time,
                     zone=conflicting_node.zone,
                     in_transit_to=conflicting_node.in_transit_to
                 )
-                # skip if this constraint already exists in this branch
                 if new_constraint in ct_node.constraints:
                     continue
-                # inherit all parent constraints and add new one
                 new_constraints = ct_node.constraints + [new_constraint]
-                # replan ONLY the constrained drone
                 drone = next(d for d in self.drones if d.drone_id == drone_id)
                 drone_constraints = [
                     c for c in new_constraints if c.drone_id == drone_id
@@ -241,10 +224,8 @@ class CBSPlanner:
                 new_path = self.low_level(
                     drone=drone, constraints=drone_constraints
                     )
-                # if no path found under these constraints, prune this branch
                 if not new_path:
                     continue
-                # build child CTNode with updated path for replanned drone
                 new_paths = dict(ct_node.paths)   # copy all paths
                 new_paths[drone_id] = new_path
 
@@ -253,6 +234,5 @@ class CBSPlanner:
                     paths=new_paths,
                     cost=self.compute_cost(new_paths)
                 )
-                # push child onto open list
                 heappush(open_list, (child.cost, child))
         return None
