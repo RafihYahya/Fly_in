@@ -5,6 +5,7 @@ Run CBS on the Impossible Dream map with A* as the low-level solver.
 from graph import TimeExpandedGraph, TENode
 from planner import CBSPlanner, Drone
 from parser import Parser
+from engine import SimulationEngine
 
 
 def compact_route(path: list[TENode]) -> list[str]:
@@ -67,6 +68,13 @@ def main():
             zones = compact_route(path)
             print(f"  Drone {drone_id:2d}: arrives turn {arrival:3d}  "
                   f"  route: {' → '.join(zones)}")
+
+        engine = SimulationEngine(
+            graph=graph,
+            coords=coords,
+            paths=solution,
+        )
+        engine.run()
 
 
 if __name__ == "__main__":
