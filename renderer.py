@@ -41,7 +41,7 @@ class Renderer:
         ax.set_aspect("equal", adjustable="box")
         ax.grid(True, linestyle=":", linewidth=0.5)
         ax.margins(x=0.15, y=1.0)
-    
+
         fig.tight_layout()
         plt.show()
 
@@ -217,4 +217,3 @@ class Renderer:
             lines.append("_".join(parts[index:index + cls.LABEL_LINE_PARTS]))
 
         return "\n".join(lines)
-
